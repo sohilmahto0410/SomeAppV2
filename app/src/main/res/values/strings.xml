@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">ICAI Batch Monitor</string>
+    <string name="select_region">Select Region</string>
+    <string name="select_pou">Select POU</string>
+    <string name="select_course">Select Course</string>
+    <string name="add_monitor">Add to Monitor List</string>
+    <string name="start_monitoring">▶ Start Monitoring</string>
+    <string name="stop_monitoring">⏹ Stop Monitoring</string>
+    <string name="check_now">🔄 Check Now (Manual)</string>
+</resources>
