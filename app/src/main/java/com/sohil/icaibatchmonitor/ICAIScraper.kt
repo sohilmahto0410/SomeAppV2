@@ -1,45 +1,51 @@
 package com.sohil.icaibatchmonitor
 
-import okhttp3.FormBody
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import org.jsoup.Jsoup
-import org.jsoup.nodes.Document
-import java.util.concurrent.TimeUnit
+import android.annotation.SuppressLint
+import android.content.Context
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 /**
- * Scrapes the ICAI Online Registration Portal.
- * URL: https://www.icaionlineregistration.org/LaunchBatchDetail.aspx
+ * Scrapes the ICAI Online Registration Portal using a hidden WebView.
  *
- * NOTE: Jsoup's Elements class has its own .filter(NodeFilter) method that conflicts
- * with Kotlin's collection .filter{}. Always call .toList() on Elements before
- * using any Kotlin lambda extensions (.filter{}, .map{}, .firstOrNull{}).
+ * WHY WEBVIEW:
+ * The portal is ASP.NET WebForms. Every dropdown change fires __doPostBack(),
+ * which submits the form via JavaScript and reloads the page with new data.
+ * OkHttp + Jsoup cannot execute JavaScript, so the dropdowns always came back
+ * empty. A WebView runs the site's own JS engine, making the page behave exactly
+ * as it does in a real browser.
+ *
+ * THREADING:
+ * WebView MUST be created and manipulated on the main thread.
+ * All public methods call withContext(Dispatchers.Main) internally, so callers
+ * may invoke them from any coroutine dispatcher (IO, Default, etc.).
+ *
+ * URL: https://www.icaionlineregistration.org/LaunchBatchDetail.aspx
  */
-class ICAIScraper {
+class ICAIScraper(private val context: Context) {
 
     companion object {
         const val BASE_URL = "https://www.icaionlineregistration.org/LaunchBatchDetail.aspx"
+        private const val PAGE_TIMEOUT_MS  = 30_000L
+        private const val POLL_INTERVAL_MS = 300L
+        private const val MAX_POLL_TRIES   = 40   // 40 × 300 ms = 12 s max
     }
 
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
-        .followRedirects(true)
-        .addInterceptor { chain ->
-            val request = chain.request().newBuilder()
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0")
-                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-                .header("Referer", BASE_URL)
-                .build()
-            chain.proceed(request)
-        }
-        .build()
-
-    data class FormFields(
-        val viewState: String = "",
-        val viewStateGenerator: String = "",
-        val eventValidation: String = ""
-    )
+    /**
+     * Kept for API compatibility with existing callers.
+     * WebView stores session state internally — no ViewState tokens needed.
+     */
+    data class FormFields(val stub: String = "")
 
     data class DropdownOption(val value: String, val label: String) {
         override fun toString() = label
@@ -59,151 +65,266 @@ class ICAIScraper {
         fun looksAvailable(): Boolean {
             val seats = availableSeats.trim().toIntOrNull()
             return when {
-                seats != null -> seats > 0
-                status.contains("open", ignoreCase = true) -> true
+                seats != null                                    -> seats > 0
+                status.contains("open",      ignoreCase = true) -> true
                 status.contains("available", ignoreCase = true) -> true
-                else -> false
+                else                                            -> false
             }
         }
     }
 
-    // ─── Internal helpers ─────────────────────────────────────────────────────────
+    // ─── WebView lifecycle ────────────────────────────────────────────────────────
 
-    private fun extractFormFields(doc: Document) = FormFields(
-        viewState = doc.select("input[name=__VIEWSTATE]").attr("value"),
-        viewStateGenerator = doc.select("input[name=__VIEWSTATEGENERATOR]").attr("value"),
-        eventValidation = doc.select("input[name=__EVENTVALIDATION]").attr("value")
-    )
+    private var _webView: WebView? = null
 
-    private fun buildBody(
-        fields: FormFields,
-        eventTarget: String,
-        region: String,
-        pou: String,
-        course: String
-    ): FormBody = FormBody.Builder()
-        .add("__EVENTTARGET", eventTarget)
-        .add("__EVENTARGUMENT", "")
-        .add("__LASTFOCUS", "")
-        .add("__VIEWSTATE", fields.viewState)
-        .add("__VIEWSTATEGENERATOR", fields.viewStateGenerator)
-        .add("__EVENTVALIDATION", fields.eventValidation)
-        .add("ddlRegion", region)
-        .add("ddlPou", pou)
-        .add("ddlCourse", course)
-        .build()
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun getOrCreateWebView(): WebView =
+        _webView ?: WebView(context).also { wv ->
+            wv.settings.javaScriptEnabled = true
+            wv.settings.domStorageEnabled = true
+            wv.settings.userAgentString =
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            _webView = wv
+        }
 
-    private fun get(url: String): Document {
-        val resp = client.newCall(Request.Builder().url(url).get().build()).execute()
-        val html = resp.body?.string() ?: throw Exception("Empty response")
-        return Jsoup.parse(html, url)
+    /** Call after the scraper is no longer needed to free the WebView's resources. */
+    fun destroy() {
+        _webView?.destroy()
+        _webView = null
     }
 
-    private fun post(
-        fields: FormFields,
-        eventTarget: String,
-        region: String,
-        pou: String,
-        course: String
-    ): Document {
-        val body = buildBody(fields, eventTarget, region, pou, course)
-        val resp = client.newCall(Request.Builder().url(BASE_URL).post(body).build()).execute()
-        val html = resp.body?.string() ?: throw Exception("Empty POST response")
-        return Jsoup.parse(html, BASE_URL)
+    // ─── Low-level WebView helpers (main thread only) ─────────────────────────────
+
+    /** Navigate to [url] and suspend until onPageFinished fires. */
+    private suspend fun loadAndWait(url: String) = suspendCancellableCoroutine<Unit> { cont ->
+        val wv = getOrCreateWebView()
+        wv.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView, url: String) {
+                if (cont.isActive) cont.resume(Unit)
+            }
+            override fun onReceivedError(
+                view: WebView, request: WebResourceRequest, error: WebResourceError
+            ) {
+                if (request.isForMainFrame && cont.isActive)
+                    cont.resumeWithException(
+                        Exception("WebView load error: ${error.description}")
+                    )
+            }
+        }
+        wv.loadUrl(url)
     }
 
     /**
-     * Parse dropdown options from a CSS selector.
-     * .toList() MUST be called on Elements before .filter{} or .map{} to avoid
-     * Jsoup's NodeFilter.filter() method hijacking Kotlin's lambda syntax.
+     * Change [dropdownId]'s value in the live DOM and call __doPostBack so
+     * ASP.NET submits the form and reloads the page with updated dependent
+     * dropdowns. Suspends until onPageFinished fires for the resulting page.
      */
-    private fun parseOptions(doc: Document, selector: String): List<DropdownOption> {
-        val elements = doc.select(selector).toList()
-        val result = mutableListOf<DropdownOption>()
-        for (el in elements) {
-            val value = el.attr("value")
-            if (value.isNotBlank() && value != "0") {
-                result.add(DropdownOption(value, el.text().trim()))
+    private suspend fun postbackAndWait(dropdownId: String, value: String) =
+        suspendCancellableCoroutine<Unit> { cont ->
+            val wv = getOrCreateWebView()
+            // Register the new client BEFORE injecting JS so we never miss the event.
+            wv.webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView, url: String) {
+                    if (cont.isActive) cont.resume(Unit)
+                }
+                override fun onReceivedError(
+                    view: WebView, request: WebResourceRequest, error: WebResourceError
+                ) {
+                    if (request.isForMainFrame && cont.isActive)
+                        cont.resumeWithException(
+                            Exception("Postback error: ${error.description}")
+                        )
+                }
             }
+            val safe = value.replace("\\", "\\\\").replace("'", "\\'")
+            wv.evaluateJavascript(
+                """
+                (function() {
+                    var el = document.getElementById('$dropdownId')
+                           || document.querySelector('select[name="$dropdownId"]');
+                    if (!el) return;
+                    el.value = '$safe';
+                    if (typeof __doPostBack === 'function') {
+                        __doPostBack('$dropdownId', '');
+                    } else {
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        var f = document.forms[0];
+                        if (f) f.submit();
+                    }
+                })();
+                """.trimIndent(), null
+            )
         }
-        return result
+
+    /** Evaluate a JS snippet and return the raw evaluateJavascript callback value. */
+    private suspend fun evalJs(js: String): String = suspendCancellableCoroutine { cont ->
+        getOrCreateWebView().evaluateJavascript(js) { result ->
+            if (cont.isActive) cont.resume(result ?: "null")
+        }
+    }
+
+    // ─── DOM extraction helpers ───────────────────────────────────────────────────
+
+    /**
+     * Extract <select> options as [[value, label], ...].
+     * Returning a native array from JS means evaluateJavascript gives us a clean
+     * JSON array without the extra string-escaping layer.
+     */
+    private suspend fun extractOptions(selectId: String): List<DropdownOption> {
+        val raw = evalJs(
+            """
+            (function() {
+                var sel = document.getElementById('$selectId')
+                        || document.querySelector('select[name="$selectId"]');
+                if (!sel) return [];
+                var out = [];
+                for (var i = 0; i < sel.options.length; i++) {
+                    var v = (sel.options[i].value || '').trim();
+                    var t = (sel.options[i].text  || '').trim();
+                    if (v && v !== '0') out.push([v, t]);
+                }
+                return out;
+            })()
+            """.trimIndent()
+        )
+        return try {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { i ->
+                val pair = arr.getJSONArray(i)
+                DropdownOption(pair.getString(0), pair.getString(1))
+            }
+        } catch (_: Exception) { emptyList() }
+    }
+
+    /**
+     * Poll [selectId] until it has at least one option.
+     * Needed because after a postback the DOM update can briefly lag behind
+     * onPageFinished.
+     */
+    private suspend fun pollForOptions(selectId: String): List<DropdownOption> {
+        repeat(MAX_POLL_TRIES) {
+            val opts = extractOptions(selectId)
+            if (opts.isNotEmpty()) return opts
+            delay(POLL_INTERVAL_MS)
+        }
+        return emptyList()
+    }
+
+    /** Scrape the batch results GridView into a list of BatchInfo. */
+    private suspend fun extractBatches(): List<BatchInfo> {
+        val raw = evalJs(
+            """
+            (function() {
+                var table = document.getElementById('ContentPlaceHolder1_gvBatch');
+                if (!table) {
+                    var tables = document.getElementsByTagName('table');
+                    for (var t = 0; t < tables.length; t++) {
+                        if (tables[t].getElementsByTagName('tr').length > 1) {
+                            table = tables[t];
+                            break;
+                        }
+                    }
+                }
+                if (!table) return [];
+                var rows = table.getElementsByTagName('tr');
+                var out = [];
+                for (var i = 1; i < rows.length; i++) {
+                    var cells = rows[i].getElementsByTagName('td');
+                    if (cells.length < 3) continue;
+                    var cols = [];
+                    for (var j = 0; j < cells.length; j++) {
+                        cols.push((cells[j].innerText || '').trim());
+                    }
+                    out.push(cols);
+                }
+                return out;
+            })()
+            """.trimIndent()
+        )
+        return try {
+            val arr = JSONArray(raw)
+            (0 until arr.length()).map { i ->
+                val colArr = arr.getJSONArray(i)
+                val cols = (0 until colArr.length()).map { j -> colArr.getString(j) }
+                BatchInfo(
+                    batchNo        = cols.getOrElse(0) { "" },
+                    startDate      = cols.getOrElse(1) { "" },
+                    endDate        = cols.getOrElse(2) { "" },
+                    venue          = cols.getOrElse(3) { "" },
+                    availableSeats = cols.getOrElse(4) { "" },
+                    status         = cols.getOrElse(5) { "" },
+                    rawColumns     = cols
+                )
+            }
+        } catch (_: Exception) { emptyList() }
     }
 
     // ─── Public API ───────────────────────────────────────────────────────────────
 
-    fun getRegions(): Pair<FormFields, List<DropdownOption>> {
-        val doc = get(BASE_URL)
-        return Pair(
-            extractFormFields(doc),
-            parseOptions(doc, "#ddlRegion option, select[name=ddlRegion] option")
-        )
-    }
+    /** Load the page fresh and return region dropdown options. */
+    suspend fun getRegions(): Pair<FormFields, List<DropdownOption>> =
+        withContext(Dispatchers.Main) {
+            withTimeoutOrNull(PAGE_TIMEOUT_MS) {
+                loadAndWait(BASE_URL)
+                val regions = pollForOptions("ddlRegion")
+                Pair(FormFields(), regions)
+            } ?: throw Exception("Timed out loading regions")
+        }
 
-    fun getPOUs(fields: FormFields, regionValue: String): Pair<FormFields, List<DropdownOption>> {
-        val doc = post(fields, "ddlRegion", regionValue, "", "")
-        return Pair(
-            extractFormFields(doc),
-            parseOptions(doc, "#ddlPou option, select[name=ddlPou] option")
-        )
-    }
+    /**
+     * Trigger the region postback and return POU options.
+     * [fields] is unused — kept for API compatibility.
+     */
+    suspend fun getPOUs(
+        fields: FormFields,
+        regionValue: String
+    ): Pair<FormFields, List<DropdownOption>> =
+        withContext(Dispatchers.Main) {
+            withTimeoutOrNull(PAGE_TIMEOUT_MS) {
+                postbackAndWait("ddlRegion", regionValue)
+                val pous = pollForOptions("ddlPou")
+                Pair(FormFields(), pous)
+            } ?: throw Exception("Timed out loading POUs")
+        }
 
-    fun getCourses(
+    /**
+     * Trigger the POU postback and return course options.
+     * [regionValue] is unused — WebView already has the region set.
+     */
+    suspend fun getCourses(
         fields: FormFields,
         regionValue: String,
         pouValue: String
-    ): Pair<FormFields, List<DropdownOption>> {
-        val doc = post(fields, "ddlPou", regionValue, pouValue, "")
-        return Pair(
-            extractFormFields(doc),
-            parseOptions(doc, "#ddlCourse option, select[name=ddlCourse] option")
-        )
-    }
-
-    fun getBatches(region: String, pou: String, course: String): List<BatchInfo> {
-        val (f1, _) = getRegions()
-        val (f2, _) = getPOUs(f1, region)
-        val (f3, _) = getCourses(f2, region, pou)
-        val doc = post(f3, "ddlCourse", region, pou, course)
-        return parseBatches(doc)
-    }
-
-    private fun parseBatches(doc: Document): List<BatchInfo> {
-        val batches = mutableListOf<BatchInfo>()
-
-        // .toList() before firstOrNull{} — same Jsoup conflict prevention
-        val allTables = doc.select(
-            "#ContentPlaceHolder1_gvBatch, table[id*=Grid], table[id*=grid], " +
-            "table.gridView, table[class*=Grid], table[class*=grid], table"
-        ).toList()
-
-        val table = allTables.firstOrNull { tbl ->
-            tbl.select("tr:first-child th, tr:first-child td").size >= 3
-        } ?: return emptyList()
-
-        val rows = table.select("tr").toList()
-
-        // Skip header row at index 0
-        for (i in 1 until rows.size) {
-            val row = rows[i]
-            val cells = row.select("td").toList()
-            if (cells.size < 3) continue
-
-            val cols = mutableListOf<String>()
-            for (cell in cells) {
-                cols.add(cell.text().trim())
-            }
-
-            batches.add(BatchInfo(
-                batchNo        = cols.getOrElse(0) { "" },
-                startDate      = cols.getOrElse(1) { "" },
-                endDate        = cols.getOrElse(2) { "" },
-                venue          = cols.getOrElse(3) { "" },
-                availableSeats = cols.getOrElse(4) { "" },
-                status         = cols.getOrElse(5) { "" },
-                rawColumns     = cols
-            ))
+    ): Pair<FormFields, List<DropdownOption>> =
+        withContext(Dispatchers.Main) {
+            withTimeoutOrNull(PAGE_TIMEOUT_MS) {
+                postbackAndWait("ddlPou", pouValue)
+                val courses = pollForOptions("ddlCourse")
+                Pair(FormFields(), courses)
+            } ?: throw Exception("Timed out loading courses")
         }
 
-        return batches
-    }
+    /**
+     * Full sequence: fresh page load → region → POU → course → scrape results.
+     * Used by the background WorkManager worker.
+     */
+    suspend fun getBatches(region: String, pou: String, course: String): List<BatchInfo> =
+        withContext(Dispatchers.Main) {
+            withTimeoutOrNull(PAGE_TIMEOUT_MS * 4) {
+                loadAndWait(BASE_URL)
+                pollForOptions("ddlRegion")          // ensure page is ready
+
+                postbackAndWait("ddlRegion", region)
+                pollForOptions("ddlPou")
+
+                postbackAndWait("ddlPou", pou)
+                pollForOptions("ddlCourse")
+
+                postbackAndWait("ddlCourse", course)
+                delay(800)                           // let the GridView render
+
+                extractBatches()
+            } ?: throw Exception("Timed out fetching batches")
+        }
 }

@@ -37,7 +37,8 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var prefs: PreferencesManager
     private lateinit var adapter: MonitoredConfigAdapter
-    private val scraper = ICAIScraper()
+    // ICAIScraper now requires a Context so it can create its hidden WebView
+    private val scraper by lazy { ICAIScraper(this) }
 
     private var regionOptions: List<ICAIScraper.DropdownOption> = emptyList()
     private var pouOptions: List<ICAIScraper.DropdownOption> = emptyList()
